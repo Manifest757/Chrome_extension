@@ -1,0 +1,259 @@
+// ── Recording State ──
+let recordingState = { isRecording: false, type: null };
+
+// ── Helpers ──
+function timestamp() {
+  const d = new Date();
+  return `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}_${String(d.getHours()).padStart(2,'0')}${String(d.getMinutes()).padStart(2,'0')}${String(d.getSeconds()).padStart(2,'0')}`;
+}
+
+function downloadDataUrl(dataUrl, filename) {
+  chrome.downloads.download({ url: dataUrl, filename, saveAs: false });
+}
+
+// ── Capture Visible Tab ──
+async function captureVisible(format = 'png') {
+  const opts = { format: format === 'jpeg' ? 'jpeg' : 'png' };
+  if (format === 'jpeg') opts.quality = 92;
+
+  return new Promise((resolve) => {
+    chrome.tabs.captureVisibleTab(null, opts, (dataUrl) => {
+      if (chrome.runtime.lastError) {
+        resolve({ success: false, error: chrome.runtime.lastError.message });
+        return;
+      }
+      const ext = format === 'jpeg' ? 'jpg' : 'png';
+      downloadDataUrl(dataUrl, `screencap_visible_${timestamp()}.${ext}`);
+      resolve({ success: true });
+    });
+  });
+}
+
+// ── Full Page Screenshot ──
+async function captureFullPage(format = 'png') {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (!tab) return { success: false, error: 'No active tab' };
+
+  // Inject the content script to handle scrolling and stitching
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: fullPageCaptureInjected,
+      args: []
+    });
+
+    const pageInfo = results[0]?.result;
+    if (!pageInfo) return { success: false, error: 'Could not read page dimensions' };
+
+    const { totalHeight, viewportHeight, viewportWidth, originalScrollY, devicePixelRatio } = pageInfo;
+    const captures = [];
+    const scrollPositions = [];
+    const steps = Math.ceil(totalHeight / viewportHeight);
+
+    for (let i = 0; i < steps; i++) {
+      const scrollY = i * viewportHeight;
+      // Scroll the page
+      await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        func: (y) => window.scrollTo(0, y),
+        args: [scrollY]
+      });
+      // Wait for paint
+      await new Promise(r => setTimeout(r, 200));
+      // Capture
+      const opts = { format: format === 'jpeg' ? 'jpeg' : 'png' };
+      if (format === 'jpeg') opts.quality = 92;
+      const dataUrl = await new Promise((resolve) => {
+        chrome.tabs.captureVisibleTab(null, opts, resolve);
+      });
+      captures.push(dataUrl);
+      scrollPositions.push(scrollY);
+    }
+
+    // Restore scroll position
+    await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: (y) => window.scrollTo(0, y),
+      args: [originalScrollY]
+    });
+
+    // Stitch images together in an offscreen document
+    const stitchedDataUrl = await stitchInOffscreen({
+      captures,
+      scrollPositions,
+      totalHeight,
+      viewportHeight,
+      viewportWidth,
+      devicePixelRatio,
+      format
+    });
+
+    if (stitchedDataUrl) {
+      const ext = format === 'jpeg' ? 'jpg' : 'png';
+      downloadDataUrl(stitchedDataUrl, `screencap_fullpage_${timestamp()}.${ext}`);
+      return { success: true };
+    }
+
+    return { success: false, error: 'Stitching failed' };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+}
+
+// This function gets injected into the page
+function fullPageCaptureInjected() {
+  return {
+    totalHeight: Math.max(
+      document.body.scrollHeight,
+      document.documentElement.scrollHeight
+    ),
+    viewportHeight: window.innerHeight,
+    viewportWidth: window.innerWidth,
+    originalScrollY: window.scrollY,
+    devicePixelRatio: window.devicePixelRatio || 1
+  };
+}
+
+// ── Offscreen Stitching ──
+async function stitchInOffscreen(params) {
+  // Create offscreen document if it doesn't exist
+  const existingContexts = await chrome.runtime.getContexts({
+    contextTypes: ['OFFSCREEN_DOCUMENT']
+  });
+
+  if (existingContexts.length === 0) {
+    await chrome.offscreen.createDocument({
+      url: 'offscreen.html',
+      reasons: ['CANVAS'],
+      justification: 'Stitch full-page screenshot images on a canvas'
+    });
+  }
+
+  return new Promise((resolve) => {
+    chrome.runtime.sendMessage({ action: 'stitchImages', params }, (response) => {
+      resolve(response?.dataUrl || null);
+    });
+  });
+}
+
+// ── Tab Recording ──
+async function startTabRecording() {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (!tab) return { success: false, error: 'No active tab' };
+
+  // Create offscreen doc for MediaRecorder
+  const existingContexts = await chrome.runtime.getContexts({
+    contextTypes: ['OFFSCREEN_DOCUMENT']
+  });
+  if (existingContexts.length === 0) {
+    await chrome.offscreen.createDocument({
+      url: 'offscreen.html',
+      reasons: ['USER_MEDIA'],
+      justification: 'Record tab audio/video via MediaRecorder'
+    });
+  }
+
+  // Get a media stream ID for the tab
+  const streamId = await chrome.tabCapture.getMediaStreamId({ targetTabId: tab.id });
+
+  const response = await new Promise((resolve) => {
+    chrome.runtime.sendMessage(
+      { action: 'startRecording', streamId, type: 'tab' },
+      resolve
+    );
+  });
+
+  if (response?.success) {
+    recordingState = { isRecording: true, type: 'tab' };
+  }
+  return response;
+}
+
+// ── Screen Recording ──
+async function startScreenRecording() {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+
+  return new Promise((resolve) => {
+    chrome.desktopCapture.chooseDesktopMedia(
+      ['screen', 'window', 'tab'],
+      tab,
+      async (streamId) => {
+        if (!streamId) {
+          resolve({ success: false, error: 'User cancelled' });
+          return;
+        }
+
+        const existingContexts = await chrome.runtime.getContexts({
+          contextTypes: ['OFFSCREEN_DOCUMENT']
+        });
+        if (existingContexts.length === 0) {
+          await chrome.offscreen.createDocument({
+            url: 'offscreen.html',
+            reasons: ['USER_MEDIA'],
+            justification: 'Record screen via MediaRecorder'
+          });
+        }
+
+        const response = await new Promise((res) => {
+          chrome.runtime.sendMessage(
+            { action: 'startRecording', streamId, type: 'screen' },
+            res
+          );
+        });
+
+        if (response?.success) {
+          recordingState = { isRecording: true, type: 'screen' };
+        }
+        resolve(response);
+      }
+    );
+  });
+}
+
+// ── Stop Recording ──
+async function stopRecording() {
+  const response = await new Promise((resolve) => {
+    chrome.runtime.sendMessage({ action: 'stopRecording' }, resolve);
+  });
+
+  if (response?.success && response?.dataUrl) {
+    downloadDataUrl(response.dataUrl, `screencap_recording_${timestamp()}.webm`);
+    recordingState = { isRecording: false, type: null };
+    return { success: true };
+  }
+
+  recordingState = { isRecording: false, type: null };
+  return response || { success: false, error: 'Stop failed' };
+}
+
+// ── Message Router ──
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  // Only handle messages from popup (not from offscreen)
+  if (sender.url && sender.url.includes('offscreen.html')) return false;
+
+  switch (msg.action) {
+    case 'captureVisible':
+      captureVisible(msg.format).then(sendResponse);
+      return true;
+
+    case 'captureFullPage':
+      captureFullPage(msg.format).then(sendResponse);
+      return true;
+
+    case 'startTabRecording':
+      startTabRecording().then(sendResponse);
+      return true;
+
+    case 'startScreenRecording':
+      startScreenRecording().then(sendResponse);
+      return true;
+
+    case 'stopRecording':
+      stopRecording().then(sendResponse);
+      return true;
+
+    case 'getRecordingState':
+      sendResponse(recordingState);
+      return false;
+  }
+});
